@@ -1,83 +1,165 @@
-# TỔNG HỢP KIẾN THỨC CỐT LÕI (RELIABILITY ENGINEERING LAB)
+# 📘 TỔNG HỢP KIẾN THỨC CỐT LÕI (RELIABILITY ENGINEERING FOR AI AGENTS)
+
+Tài liệu này tổng hợp toàn bộ kiến thức, kiến trúc, sơ đồ trực quan và bài học thực tế từ dự án **Reliability Engineering for Production Agents**.
 
 ---
 
 ## 1. Mục Tiêu Dự Án: Reliability Gateway là gì?
-Là một **Cổng tiếp nhận & điều phối (Gateway)** đứng giữa Người dùng và các Nhà cung cấp AI (LLM Providers như OpenAI, Claude). 
-- **Mục tiêu:** Giảm chi phí (0$), giảm độ trễ (0ms) bằng Cache; tự động ngắt kết nối khi Provider lỗi (Circuit Breaker); tự chuyển sang Provider dự phòng (Fallback) để không bao giờ làm sập ứng dụng.
+
+Khi gọi các mô hình AI (OpenAI, Anthropic, Gemini, Local LLM), hệ thống thường gặp:
+- **Độ trễ và chi phí cao:** Câu hỏi lặp lại nhiều lần vẫn phải gọi lên AI tốn tiền ($) và mất thời gian chờ (vài giây).
+- **API bị sập / Rate Limit (429, 5xx):** Khi nhà cung cấp AI gặp sự cố, ứng dụng có thể bị treo hoặc sập theo.
+- **Rủi ro bảo mật & Sai lệch dữ liệu:** Dữ liệu nhạy cảm (mật khẩu, số tài khoản) bị lưu bừa bãi; câu hỏi năm 2024 lại trả lời bằng dữ liệu năm 2026.
+
+👉 **Reliability Gateway** là một **Cổng tiếp nhận & điều phối thông minh**, đóng vai trò là "người bảo vệ" đứng trước các LLM Providers để mang lại hệ thống **chịu lỗi cao (Fault-tolerant), tiết kiệm chi phí và luôn sẵn sàng 99.9%**.
 
 ---
 
-## 2. Sơ Đồ Luồng Xử Lý Của 1 Request
+## 2. Sơ Đồ Kiến Trúc Toàn Thể Của Gateway
 
 ```mermaid
 flowchart TD
-    User([1. User Query]) --> CacheCheck{2. Cache Check}
-    CacheCheck -- Hit (>= Threshold & Hợp lệ) --> ReturnCache[Trả về từ Cache: 0ms, 0$]
+    User(["1. User Query"]) --> CacheCheck{"2. Cache Check (Semantic)"}
     
-    CacheCheck -- Miss --> CBPrimary{3. Circuit Breaker Primary}
-    CBPrimary -- OPEN (Đang ngắt mạch) --> CBBackup
-    CBPrimary -- CLOSED / HALF_OPEN --> CallPrimary[Gọi Provider Primary]
+    %% Nhánh 1: Cache Hit
+    CacheCheck -- "HIT (Score >= 0.92 & Hợp lệ)" --> ReturnCache["Trả về từ Cache: 0ms, $0"]
     
-    CallPrimary -- Thành công --> SaveCache[Lưu vào Cache] --> ReturnResponse[Trả về kết quả]
-    CallPrimary -- Thất bại / Lỗi --> CBBackup{4. Circuit Breaker Backup}
+    %% Nhánh 2: Gọi Primary Provider
+    CacheCheck -- "MISS / Không thể cache" --> CBPrimary{"3. Circuit Breaker Primary"}
+    CBPrimary -- "OPEN (Đang ngắt mạch)" --> CBBackup
+    CBPrimary -- "CLOSED / HALF_OPEN" --> CallPrimary["Gọi Primary Provider"]
     
-    CBBackup -- CLOSED / HALF_OPEN --> CallBackup[Gọi Provider Backup]
-    CallBackup -- Thành công --> SaveCache
+    CallPrimary -- "Thành công" --> SaveCache1["Lưu vào Cache"] --> ReturnPrimary["Trả về kết quả (route: primary)"]
+    CallPrimary -- "Thất bại / Exception" --> CBBackup{"4. Circuit Breaker Backup"}
     
-    CBBackup -- OPEN / Thất bại --> StaticFallback[5. Static Fallback: Báo hệ thống bận]
+    %% Nhánh 3: Fallback sang Backup Provider
+    CBBackup -- "CLOSED / HALF_OPEN" --> CallBackup["Gọi Backup Provider"]
+    CallBackup -- "Thành công" --> SaveCache2["Lưu vào Cache"] --> ReturnBackup["Trả về kết quả (route: fallback)"]
+    
+    %% Nhánh 4: Static Fallback
+    CBBackup -- "OPEN / Thất bại" --> StaticFallback["5. Static Fallback: 'Hệ thống tạm thời gián đoạn...'"]
 ```
 
 ---
 
-## 3. Các Khái Niệm Cốt Lõi
+## 3. Máy Trạng Thái Của Circuit Breaker (Cầu Dao Điện 3 Trạng Thái)
 
-### A. Semantic Cache (Bộ nhớ đệm ngữ nghĩa)
-* **Ý tưởng:** Nếu câu hỏi mới tương tự câu đã từng hỏi (dù khác chữ), lấy luôn câu trả lời cũ ra trả về.
-* **N-gram & Cosine Similarity:** Cắt câu thành các mảnh 3 ký tự (ví dụ `"hel"`, `"ell"`), đếm tần suất và tính góc Cosine để ra điểm từ `0.0` (khác hẳn) đến `1.0` (giống hệt).
-* **Privacy Guardrails (Rào chắn bảo mật):** Câu có chứa `password`, `ssn`, `balance`, `credit card`... thì **không bao giờ lưu cache / không đọc cache**.
-* **False-hit Detection (Chống khớp nhầm):** Nếu 2 câu lệch nhau về con số/năm (ví dụ *năm 2024* vs *năm 2026*) thì dù độ tương đồng cao vẫn coi là **khác nghĩa**, từ chối cache.
+Circuit Breaker bảo vệ hệ thống theo nguyên lý **Fail-Fast** (Ngã nhanh để không làm nghẽn hàng đợi / chống bão retry).
 
-### B. Circuit Breaker (Cầu dao điện / Aptomat 3 trạng thái)
-Giúp hệ thống "ngã nhanh" (Fail Fast) khi một Provider bị sập, tránh gửi dồn dập làm nghẽn mạng (Retry Storm).
-* **`CLOSED` (Đóng mạch):** Trạng thái bình thường. Cho request đi qua. Nếu lỗi liên tiếp $\ge$ `failure_threshold` $\rightarrow$ Chuyển sang `OPEN`.
-* **`OPEN` (Ngắt mạch):** Chặn toàn bộ request ngay lập tức (không gọi sang Provider). Đợi hết `reset_timeout_seconds` $\rightarrow$ Chuyển sang `HALF_OPEN`.
-* **`HALF_OPEN` (Hé mở thăm dò):** Cho đúng 1 request đi qua thử:
-  * Nếu thành công $\ge$ `success_threshold` $\rightarrow$ Về `CLOSED` (lý do: `"probe_success"`).
-  * Nếu thất bại $\rightarrow$ Quay lại `OPEN` ngay lập tức (lý do: `"probe_failure"`).
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED : Khởi động ban đầu
+    
+    CLOSED --> OPEN : Gặp lỗi liên tiếp >= failure_threshold (Lý do: failure_threshold_reached)
+    note right of CLOSED : Mạch đóng: Mọi request đi qua bình thường
+    
+    OPEN --> HALF_OPEN : Hết thời gian phạt reset_timeout_seconds (Dùng time.monotonic)
+    note right of OPEN : Mạch ngắt: Chặn ngay lập tức, ném CircuitOpenError
+    
+    HALF_OPEN --> CLOSED : Gọi thử thành công >= success_threshold (Lý do: probe_success)
+    HALF_OPEN --> OPEN : Gọi thử lại thất bại ngay lập tức (Lý do: probe_failure)
+    note right of HALF_OPEN : Thử nghiệm: Cho đúng 1 request thăm dò (probe)
+```
 
-### C. Fallback Chain (Chuỗi dự phòng)
-* **Primary:** Nhà cung cấp chính (tốt nhất).
-* **Backup:** Nhà cung cấp dự phòng (khi Primary bị lỗi hoặc ngắt mạch).
-* **Static Fallback:** Cả Primary và Backup đều chết $\rightarrow$ Trả về câu thông báo nhẹ nhàng: *"Dịch vụ tạm thời gián đoạn..."*.
-
-### D. Shared Redis Cache (Cache phân tán)
-* **In-memory cache:** Lưu trong RAM của 1 máy (máy khác không thấy).
-* **Redis cache:** Lưu trong DB Redis dùng chung cho nhiều server (Multi-instance), có TTL (tự hủy sau một thời gian).
-
-### E. Chaos Testing & SRE Metrics
-* **Chaos Testing:** Cố tình giả lập mạng chập chờn, lỗi 100% để kiểm tra độ chịu tải và khả năng tự phục hồi.
-* **Availability:** Tỉ lệ request thành công / Tổng request.
-* **Latency P50 / P95 / P99:** 
-  * P50: Mức trung vị (50% người dùng nhận kết quả nhanh hơn mức này).
-  * P95/P99: Đo 5% và 1% các trường hợp bị chậm nhất để đánh giá lúc nghẽn mạng.
-* **Recovery Time (MTTR):** Thời gian tính từ lúc Circuit Breaker chuyển `OPEN` đến khi chuyển về `CLOSED` (tính bằng ms).
+### 📌 Bẫy code quan trọng trong Circuit Breaker:
+- **Tách riêng `if/elif`:** Phải phân biệt rõ `reason="probe_failure"` (khi đang ở `HALF_OPEN`) và `reason="failure_threshold_reached"` (khi đang ở `CLOSED`). Tuyệt đối không gộp bằng `or`.
+- **Đo thời gian trôi qua:** Sử dụng `time.monotonic()` thay vì `time.time()` để không bị ảnh hưởng bởi việc đổi múi giờ hoặc đồng bộ NTP của hệ điều hành.
 
 ---
 
-## 4. Bản Đồ File Cần Làm (5 Files)
+## 4. Semantic Cache & Hai Chiếc "Kính Lọc" An Toàn
 
-| File | Nhiệm vụ chính |
-|:---|:---|
-| `circuit_breaker.py` | Cài đặt 4 hàm: `allow_request()`, `call()`, `record_success()`, `record_failure()`. |
-| `cache.py` | Cài đặt `similarity()` (n-gram cosine), `get()`, `set()` cho Memory Cache và Redis Cache. |
-| `gateway.py` | Cài đặt `complete()` kết nối Cache $\rightarrow$ Circuit Breaker $\rightarrow$ Fallback $\rightarrow$ Static Fallback. |
-| `chaos.py` | Cài đặt `run_scenario()` và `calculate_recovery_time_ms()`. |
-| `metrics.py` | Cài đặt `write_csv()` xuất báo cáo. |
+### A. Thuật toán Cosine N-Gram Similarity
+Không so khớp chuỗi thô (`a == b`), ta tách chuỗi thành:
+1. **Word tokens:** `text.lower().split()`
+2. **Character 3-grams:** `"refund"` $\rightarrow$ `["ref", "efu", "fun", "und"]`
+3. Đếm tần suất với `Counter` và tính góc Cosine giữa 2 vector:
+   $$\text{Cosine}(A, B) = \frac{\sum (A_i \times B_i)}{\sqrt{\sum A_i^2} \times \sqrt{\sum B_i^2}}$$
+
+### B. Hai Lớp Bảo Vệ Bắt Buộc:
+1. **🛡️ Privacy Guardrails (`_is_uncacheable`):**
+   - Chặn các câu chứa từ khóa nhạy cảm: `password`, `ssn`, `balance`, `credit card`, `user_\d+`...
+   - **Quy tắc:** Không đọc từ cache và không bao giờ lưu vào cache.
+2. **🛡️ False-Hit Detection (`_looks_like_false_hit`):**
+   - Phát hiện các câu có độ tương đồng ngữ nghĩa cao nhưng **khác nhau về số/năm 4 chữ số** (ví dụ: *Năm 2024* vs *Năm 2026*).
+   - **Quy tắc:** Từ chối Cache và ghi vào `false_hit_log` với lý do `"date_or_number_mismatch"`.
 
 ---
 
-## 5. Lưu Ý Kỹ Thuật Quan Trọng (Bẫy Thường Gặp)
-1. **`record_failure()` trong Circuit Breaker:** Phải tách riêng 2 trường hợp `if state == HALF_OPEN` (lý do `"probe_failure"`) và `elif failure_count >= threshold` (lý do `"failure_threshold_reached"`). Không được gộp chung bằng `or`.
-2. **Thời gian đo Circuit Breaker:** Dùng `time.monotonic()` để đo khoảng cách thời gian trôi qua, không bị ảnh hưởng bởi đổi giờ hệ thống.
-3. **Privacy & False-hit:** Phải kiểm tra trước khi lấy dữ liệu từ cache ra và trước khi ghi dữ liệu vào cache.
+## 5. So Sánh In-Memory Cache vs Shared Redis Cache
+
+### ❌ Khi dùng In-Memory Cache (Bị phân mảnh):
+Khi triển khai nhiều Server (Multi-instance), mỗi server có một vùng RAM riêng biệt:
+
+```mermaid
+flowchart TD
+    UserA["User A"] --> LB["Load Balancer"]
+    UserB["User B"] --> LB
+    
+    subgraph OldArch ["Kiến trúc In-Memory Cũ (Bị phân mảnh)"]
+        LB --> Pod1["Server 1 - RAM Cache A"]
+        LB --> Pod2["Server 2 - RAM Cache B"]
+    end
+```
+*Nhược điểm:* Server 1 đã cache câu trả lời nhưng Server 2 không biết, dẫn đến gọi trùng lặp lên LLM và tốn chi phí.
+
+---
+
+### ✅ Khi dùng Shared Redis Cache (Bộ nhớ dùng chung):
+Dùng cơ sở dữ liệu in-memory tập trung (Redis Cluster) đặt ở giữa:
+
+```mermaid
+flowchart TD
+    UserA["User A"] --> LB["Load Balancer"]
+    UserB["User B"] --> LB
+    
+    subgraph NewArch ["Kiến trúc Mới (Shared Redis Cache)"]
+        LB --> Server1["Server 1"]
+        LB --> Server2["Server 2"]
+        Server1 <--> Redis[("Redis Cluster")]
+        Server2 <--> Redis
+    end
+```
+*Ưu điểm:*
+- **Chia sẻ tức thì:** Bất kỳ server nào xử lý câu hỏi đều lưu vào Redis để mọi server khác dùng chung.
+- **Tự động dọn rác (TTL):** Redis dùng lệnh `EXPIRE` tự xóa key khi hết hạn, code Python không cần dọn rác thủ công.
+- **Key Hashing:** Dùng hàm băm MD5 ngắn `rl:cache:md5(query)` để tạo khóa truy xuất $O(1)$.
+
+---
+
+## 6. Docker & Containerization (Hộp Thần Kỳ)
+
+- **Docker là gì?** Đóng gói toàn bộ (Hệ điều hành Linux thu nhỏ + Phần mềm + Cấu hình) vào một "thùng container" độc lập.
+- **Vai trò trong bài lab:** `docker-compose.yml` bật ngay một máy chủ `redis:7-alpine` chỉ bằng lệnh:
+  ```bash
+  docker compose up -d
+  ```
+  *(Khi dùng xong, gõ `docker compose down` để dọn sạch sẽ, không để lại file rác).*
+
+---
+
+## 7. Chaos Testing & Các Chỉ Số SRE Cốt Lõi
+
+### A. Ba Kịch Bản Chaos:
+1. `primary_timeout_100`: Primary sập 100% $\rightarrow$ Kiểm tra Circuit Breaker ngắt mạch và toàn bộ lưu lượng chuyển sang Backup.
+2. `primary_flaky_50`: Primary chập chờn 50% $\rightarrow$ Kiểm tra Circuit Breaker dao động nhịp nhàng và tự phục hồi.
+3. `all_healthy`: Trạng thái bình thường $\rightarrow$ Đo đạc baseline chuẩn.
+
+### B. Bảng Chỉ Số Đo Lường:
+- **Availability (Độ sẵn sàng):** Tỉ lệ request thành công / Tổng request (Mục tiêu $\ge 99\%$).
+- **P50 / P95 / P99 Latency:** 
+  - **P50:** Độ trễ trung vị của 50% người dùng.
+  - **P95 / P99:** Đo 5% và 1% các trường hợp bị chậm nhất khi nghẽn mạng để đảm bảo trải nghiệm người dùng lúc tồi tệ nhất.
+- **Recovery Time (MTTR):** Thời gian tính từ lúc Circuit Breaker chuyển `OPEN` đến khi chuyển về `CLOSED` (tính bằng ms).
+
+---
+
+## 8. Kết Quả Thực Nghiệm Đạt Được
+
+| Chỉ số | Không có Cache | Có Semantic Cache | Hiệu quả cải thiện |
+|---|---:|---:|---|
+| **Availability** | 94.67% | **99.67%** | **+5.0%** |
+| **Chi phí tiêu tốn** | $0.126682 | **$0.047186** | **Tiết kiệm 62.7% chi phí!** |
+| **Tỉ lệ Cache Hit** | 0.0% | **63.33%** | Giảm tải 63% truy vấn |
+| **Số lần Circuit ngắt mạch** | 20 lần | **8 lần** | **Giảm 60% nguy cơ quá tải** |
+| **Thời gian phục hồi (MTTR)** | 2409 ms | **2221 ms** | Tự phục hồi sau ~2.2 giây |
